@@ -28,7 +28,7 @@ class LegacySynth {
     int count_=16;
     uint64_t age_=0;
     int master_=16383;
-    struct Channel {int program=0,volume=100,expression=127,pan=64,bend=8192,range=2,rpnMsb=127,rpnLsb=127;bool sustain=false;};
+    struct Channel {int program=0,volume=100,expression=127,pan=64,bend=8192,range=2,rpnMsb=127,rpnLsb=127,bankMsb=0;bool sustain=false,drums=false;};
     struct Voice {int channel=-1,note=0,velocity=0;bool held=false,released=false;uint64_t age=0;};
     std::array<Channel,16> channels_{};
     std::array<Voice,32> voices_{};
@@ -95,15 +95,17 @@ public:
             }
             off(index,true);
             voices_[index]={channel,a,b,true,false,++age_};
-            BYTE patch[]={static_cast<BYTE>(channel==9?120:121),0,static_cast<BYTE>(c.program),static_cast<BYTE>(a)};
+            BYTE patch[]={static_cast<BYTE>((channel==9||c.drums)?120:121),0,static_cast<BYTE>(c.program),static_cast<BYTE>(a)};
             int amp=amplitude(voices_[index]);
             fn<int(__cdecl*)(void*,int,const BYTE*,int,int,int,int)>(9)(engine_,index,patch,amp*(127-c.pan)/127,amp*c.pan/127,(c.bend-8192)*c.range*8,0);
             return;
         }
-        if(status==0xc0){c.program=a;return;}
+        // Bank Select is latched by Program Change; CC121 must not clear it.
+        if(status==0xc0){c.program=a;c.drums=c.bankMsb==120;return;}
         if(status==0xe0){c.bend=a|(b<<7);refresh(channel);return;}
         if(status!=0xb0)return;
         switch(a) {
+        case 0:c.bankMsb=b;break;
         case 7:c.volume=b;break;
         case 10:c.pan=b;break;
         case 11:c.expression=b;break;

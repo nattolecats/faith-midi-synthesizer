@@ -3,6 +3,11 @@
 #include <array>
 #include "legacy.h"
 
+inline bool isGmReset(const BYTE* data,size_t size) {
+    return size==6&&data&&data[0]==0xf0&&data[1]==0x7e&&data[2]<128&&
+        data[3]==9&&(data[4]==1||data[4]==3)&&data[5]==0xf7;
+}
+
 // RTPSynthOpen returns a C interface table. See docs/faith-abi.md.
 // Type 4 and 5 return an owner wrapping the same interface table.
 class FaithEngine {
@@ -66,7 +71,20 @@ public:
         };
         // Type 4/5 retain sustained notes after CC64=0. Defer note-offs here instead.
         if(status==0xb0&&a==64){sustain_[channel]=b>=64;if(!sustain_[channel])release();return;}
-        if(status==0xb0&&a==121){sustain_[channel]=false;release();}
+        if(status==0xb0&&a==121){
+            sustain_[channel]=false;release();
+            raw(message);
+            // Do not depend on the native Reset All Controllers implementation.
+            raw(0xb0|channel|(64<<8));
+            raw(0xb0|channel|(1<<8));
+            raw(0xb0|channel|(33<<8));
+            raw(0xe0|channel|(64<<16));
+            raw(0xd0|channel);
+            raw(0xb0|channel|(11<<8)|(127<<16));
+            raw(0xb0|channel|(100<<8)|(127<<16));
+            raw(0xb0|channel|(101<<8)|(127<<16));
+            return;
+        }
         if(status==0xb0&&a==120){held_[channel]={};deferred_[channel]={};}
         if(status==0xb0&&a==123){
             for(unsigned note=0;note<128;++note)while(held_[channel][note]){
@@ -88,7 +106,6 @@ public:
         if(n<2||bytes[0]!=0xf0||bytes[n-1]!=0xf7) return;
         if(bytes[1]!=0x7e && bytes[1]!=0x7f) return;
         if(n<6) return;
-        if(n==6&&bytes[1]==0x7e&&bytes[3]==9&&(bytes[4]==1||bytes[4]==3)){reset();return;}
         if(bytes[1]==0x7f && n<8) return;
         sysex_(synth_,0,bytes,n);
     }
@@ -105,29 +122,52 @@ public:
 class FaithSynth {
     std::array<std::unique_ptr<FaithEngine>,16> engines_{};
     std::array<bool,16> audible_{};
-    unsigned count_=1;
+    unsigned count_=0;
+    DWORD type_=4;
 public:
     bool open(DWORD type=readType()) {
+        // Destroy ALL engines before opening any replacement: Type 2/5 have
+        // shared native state. A port reset alone can leave voices/controllers.
+        audible_.fill(false);
+        count_=0;
+        for(auto& engine:engines_)engine.reset();
+        type_=type;
         count_=(type==1||type==3||type==4)?16:1;
         for(unsigned i=0;i<count_;++i){
             engines_[i]=std::make_unique<FaithEngine>();
-            if(!engines_[i]->open(type))return false;
+            if(!engines_[i]->open(type)){
+                for(auto& engine:engines_)engine.reset();
+                count_=0;return false;
+            }
+        }
+        for(unsigned channel=0;channel<16;++channel){
+            auto cc=[&](unsigned controller,unsigned value){send(0xb0|channel|(controller<<8)|(value<<16));};
+            cc(121,0);cc(0,0);cc(32,0);
+            cc(7,100);cc(10,64);cc(11,127);
+            cc(101,0);cc(100,0);cc(6,2);cc(38,0);
+            cc(101,127);cc(100,127);
+            send(0xc0|channel);
+            send(0xe0|channel|(64<<16));
         }
         return true;
     }
-    void reset(){for(unsigned i=0;i<count_;++i)engines_[i]->reset();}
+    void reset(){open(type_);}
     void send(uint32_t message){
-        // Only bank 0 is supported by this GM compatibility layer. Faith's
-        // native bank handling can select percussion ROMs on melodic channels.
-        // Preserve the controller/channel and Program Change; normalize BOTH
-        // halves of Bank Select for every backend, including channel 10.
-        unsigned status=message&0xf0,controller=(message>>8)&127;
-        if(status==0xb0&&(controller==0||controller==32))message&=0x0000ffff;
+        if(!count_)return; // A failed reopen stays silent, never uses old voices.
+        // Preserve explicit MSB 120 percussion selection on any channel.
+        // Other nonzero banks can accidentally select Faith's percussion ROMs;
+        // keep their GM fallback and normalize every LSB to zero. Never remap
+        // channels: added drum parts need independent programs/controllers.
+        unsigned status=message&0xf0,controller=(message>>8)&127,value=(message>>16)&127;
+        if(status==0xb0&&(controller==32||(controller==0&&value!=120)))message&=0x0000ffff;
         unsigned engine=count_==1?0:message&15;
         if((message&0xf0)==0x90&&(message&0x7f0000))audible_[engine]=true;
         engines_[engine]->send(message);
     }
-    void sysex(const BYTE* data,unsigned size){for(unsigned i=0;i<count_;++i)engines_[i]->sysex(data,size);}
+    void sysex(const BYTE* data,unsigned size){
+        if(isGmReset(data,size)){reset();return;}
+        for(unsigned i=0;i<count_;++i)engines_[i]->sysex(data,size);
+    }
     void render(int16_t* out,DWORD gain,DWORD channelVolume) {
         std::array<int64_t,256> mix{};
         for(unsigned engine=0;engine<count_;++engine){

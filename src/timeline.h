@@ -8,9 +8,10 @@
 // Receipt times are measured on one monotonic clock. Keep events separated on
 // the PCM timeline even when the audio device asks for several buffers at once.
 class MidiTimeline {
-    struct Event {uint64_t frame;Packet packet;std::vector<BYTE> data;bool protectedOff=false;};
+    struct Event {uint64_t frame;Packet packet;std::vector<BYTE> data;bool protectedOff=false;uint64_t generation=0;};
     std::multimap<uint64_t,Event> events_;
     std::array<std::array<std::deque<uint64_t>,128>,16> noteStarts_{};
+    std::array<uint64_t,16> generations_{};
     std::mutex mutex_;
     uint64_t frame_=0;
     size_t bytes_=0;
@@ -35,6 +36,9 @@ public:
         for(auto& event:due)switch(event.packet.command) {
         case Command::Short: {
             uint32_t message=event.packet.value;unsigned status=message&240,ch=message&15,note=(message>>8)&127,velocity=(message>>16)&127;
+            // Reset may precede this deferred off in the same already-drained
+            // batch. It must not release a note started after that reset.
+            if(event.protectedOff&&event.generation!=generations_[ch])break;
             auto& starts=noteStarts_[ch][note];
             if(status==0x90&&velocity){if(starts.size()<128)starts.push_back(frame_);}
             if((status==0x80||(status==0x90&&!velocity))&&!event.protectedOff&&!starts.empty()) {
@@ -42,7 +46,7 @@ public:
                 // 22050/32000-Hz engines may need two 44100-Hz blocks to produce
                 // a newly started voice. Only extend notes compressed below that.
                 if(frame_<earliest){
-                    event.protectedOff=true;event.frame=earliest;
+                    event.protectedOff=true;event.frame=earliest;event.generation=generations_[ch];
                     std::lock_guard<std::mutex> lock(mutex_);events_.emplace(earliest,std::move(event));break;
                 }
             }
@@ -50,7 +54,7 @@ public:
             synth.send(message);break;
         }
         case Command::Long:
-            if(event.data.size()==6&&event.data[0]==0xf0&&event.data[1]==0x7e&&event.data[3]==9){clearNoteTimes();}
+            if(isGmReset(event.data.data(),event.data.size()))clearNoteTimes();
             synth.sysex(event.data.data(),static_cast<unsigned>(event.data.size()));break;
         case Command::Reset:clearNoteTimes();synth.reset();break;
         case Command::Volume:volume_=event.packet.value;break;
@@ -60,7 +64,10 @@ public:
     }
 private:
     void clearNoteTimes(int onlyChannel=-1){
-        for(unsigned ch=0;ch<16;++ch)if(onlyChannel<0||ch==unsigned(onlyChannel))for(auto& note:noteStarts_[ch])note.clear();
+        for(unsigned ch=0;ch<16;++ch)if(onlyChannel<0||ch==unsigned(onlyChannel)){
+            ++generations_[ch];
+            for(auto& note:noteStarts_[ch])note.clear();
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         for(auto it=events_.begin();it!=events_.end();)if(it->second.protectedOff&&(onlyChannel<0||(it->second.packet.value&15)==unsigned(onlyChannel)))it=events_.erase(it);else ++it;
     }
