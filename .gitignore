@@ -1,0 +1,8 @@
+rt_*_*.dll
+mclib.dll
+.deps/
+build/
+*.exe
+FaithMidi32.dll
+FaithMidi64.dll
+*.ini

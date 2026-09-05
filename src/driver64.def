@@ -1,0 +1,4 @@
+LIBRARY FaithMidi64
+EXPORTS
+    DriverProc
+    modMessage
